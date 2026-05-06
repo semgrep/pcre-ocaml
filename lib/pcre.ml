@@ -104,6 +104,9 @@ let int_of_cflag = function
 let coll_icflag icflag flag = int_of_cflag flag lor icflag
 let cflags flags = List.fold_left coll_icflag 0 flags
 
+external int_of_icflag : icflag -> int = "%identity"
+external icflag_of_int : int -> icflag = "%identity"
+
 let cflag_of_int = function
   | 0x0001 -> `CASELESS
   | 0x0002 -> `MULTILINE
@@ -241,6 +244,8 @@ external firstbyte : regexp -> firstbyte_info = "pcre_firstbyte_stub"
 external firsttable : regexp -> string option = "pcre_firsttable_stub"
 external lastliteral : regexp -> char option = "pcre_lastliteral_stub"
 external study_stat : regexp -> study_stat = "pcre_study_stat_stub" [@@noalloc]
+external pattern : regexp -> string = "pcre_pattern_stub"
+external jit_compiled : regexp -> bool = "pcre_jit_compiled_stub" [@@noalloc]
 
 (* Compilation of patterns *)
 

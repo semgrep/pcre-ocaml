@@ -47,6 +47,7 @@ typedef long *caml_int_ptr;
 #include <caml/callback.h>
 #include <caml/custom.h>
 #include <caml/fail.h>
+#include <caml/intext.h>
 #include <caml/memory.h>
 #include <caml/mlvalues.h>
 #include <caml/version.h>
@@ -103,11 +104,21 @@ static value var_Not_studied; /* Variant [`Not_studied] */
 static value var_Studied;     /* Variant [`Studied] */
 static value var_Optimal;     /* Variant [`Optimal] */
 
-/* Data associated with OCaml values of PCRE regular expression */
+/* Data associated with OCaml values of PCRE regular expression.
+
+   Beyond the live PCRE pointers, we also retain enough metadata to
+   recompile the pattern from scratch.  This is what makes a regexp
+   serializable via Marshal: serialize writes the recipe, deserialize
+   re-runs pcre_compile + pcre_study. */
 struct pcre_ocaml_regexp {
   pcre *rex;
   pcre_extra *extra;
   int studied;
+  int jit_compile;       /* set when pcre_study was called with JIT */
+  int compile_options;   /* the icflag passed to pcre_compile */
+  int has_custom_tables; /* 1 if compiled with non-NULL chartables */
+  size_t pattern_len;
+  char *pattern;         /* caml_stat_alloc'd copy of source pattern */
 };
 
 #define Pcre_ocaml_regexp_val(v)                                               \
@@ -116,10 +127,21 @@ struct pcre_ocaml_regexp {
 #define get_rex(v) Pcre_ocaml_regexp_val(v)->rex
 #define get_extra(v) Pcre_ocaml_regexp_val(v)->extra
 #define get_studied(v) Pcre_ocaml_regexp_val(v)->studied
+#define get_jit_compile(v) Pcre_ocaml_regexp_val(v)->jit_compile
+#define get_compile_options(v) Pcre_ocaml_regexp_val(v)->compile_options
+#define get_has_custom_tables(v) Pcre_ocaml_regexp_val(v)->has_custom_tables
+#define get_pattern(v) Pcre_ocaml_regexp_val(v)->pattern
+#define get_pattern_len(v) Pcre_ocaml_regexp_val(v)->pattern_len
 
 #define set_rex(v, r) Pcre_ocaml_regexp_val(v)->rex = r
 #define set_extra(v, e) Pcre_ocaml_regexp_val(v)->extra = e
 #define set_studied(v, s) Pcre_ocaml_regexp_val(v)->studied = s
+#define set_jit_compile(v, j) Pcre_ocaml_regexp_val(v)->jit_compile = j
+#define set_compile_options(v, o) Pcre_ocaml_regexp_val(v)->compile_options = o
+#define set_has_custom_tables(v, h)                                            \
+  Pcre_ocaml_regexp_val(v)->has_custom_tables = h
+#define set_pattern(v, p) Pcre_ocaml_regexp_val(v)->pattern = p
+#define set_pattern_len(v, l) Pcre_ocaml_regexp_val(v)->pattern_len = l
 
 /* Data associated with OCaml values of PCRE tables */
 struct pcre_ocaml_tables {
@@ -204,6 +226,9 @@ static int pcre_callout_handler(pcre_callout_block *cb) {
   return 0;
 }
 
+static struct custom_operations regexp_ops;
+static struct custom_operations tables_ops;
+
 /* Fetches the named OCaml-values + caches them and
    calculates + caches the variant hash values */
 CAMLprim value pcre_ocaml_init(value __unused v_unit) {
@@ -219,6 +244,11 @@ CAMLprim value pcre_ocaml_init(value __unused v_unit) {
 
   pcre_callout = &pcre_callout_handler;
 
+  /* Required for Marshal.from_* to find the deserialize callback by
+     identifier (regexp_ops.identifier = "pcre_ocaml_regexp"). */
+  caml_register_custom_operations(&regexp_ops);
+  caml_register_custom_operations(&tables_ops);
+
   return Val_unit;
 }
 
@@ -227,16 +257,25 @@ static void pcre_dealloc_tables(value v_tables) {
   (pcre_free)((void *)get_tables(v_tables));
 }
 
-/* Finalizing deallocation function for compiled regular expressions */
+/* Finalizing deallocation function for compiled regular expressions.
+
+   Defensive against partially-populated structs (the deserializer zeros
+   the destination first and may raise mid-construction; in that case
+   the runtime still calls this finalizer). */
 static void pcre_dealloc_regexp(value v_rex) {
   void *extra = get_extra(v_rex);
+  pcre *rex = get_rex(v_rex);
+  char *pattern = get_pattern(v_rex);
   if (extra != NULL)
 #ifdef PCRE_STUDY_JIT_COMPILE
     pcre_free_study(extra);
 #else
     pcre_free(extra);
 #endif
-  (pcre_free)(get_rex(v_rex));
+  if (rex != NULL)
+    (pcre_free)(rex);
+  if (pattern != NULL)
+    caml_stat_free(pattern);
 }
 
 /* Raising exceptions */
@@ -304,10 +343,14 @@ static inline void raise_internal_error(char *msg) {
 
 /* PCRE pattern compilation */
 
+static void pcre_serialize_regexp(value v_rex, uintnat *bsize_32,
+                                  uintnat *bsize_64);
+static uintnat pcre_deserialize_regexp(void *dst);
+
 static struct custom_operations regexp_ops = {
     "pcre_ocaml_regexp",        pcre_dealloc_regexp,
     custom_compare_default,     custom_hash_default,
-    custom_serialize_default,   custom_deserialize_default,
+    pcre_serialize_regexp,      pcre_deserialize_regexp,
     custom_compare_ext_default, custom_fixed_length_default};
 
 /* Makes compiled regular expression from compilation options, an optional
@@ -318,19 +361,31 @@ CAMLprim value pcre_compile_stub(intnat v_opt, value v_tables, value v_pat) {
   size_t regexp_size, ocaml_regexp_size = sizeof(struct pcre_ocaml_regexp);
   const char *error = NULL; /* pointer to possible error message */
   int error_ofs = 0;        /* offset in the pattern at which error occurred */
+  size_t pattern_len = caml_string_length(v_pat);
+  char *pattern_copy = caml_stat_alloc(pattern_len + 1);
 
   /* If v_tables = [None], then pointer to tables is NULL, otherwise
      set it to the appropriate value */
-  chartables tables = Is_none(v_tables) ? NULL : get_tables(Field(v_tables, 0));
+  int has_custom_tables = !Is_none(v_tables);
+  chartables tables = has_custom_tables ? get_tables(Field(v_tables, 0)) : NULL;
+
+  /* Copy the source pattern up front so that if pcre_compile fails we
+     can free it without leaking; the underlying String_val buffer can
+     legitimately contain embedded NUL bytes, hence caml_string_length /
+     memcpy rather than strdup. */
+  memcpy(pattern_copy, String_val(v_pat), pattern_len);
+  pattern_copy[pattern_len] = '\0';
 
   /* Compiles the pattern */
   pcre *regexp =
-      pcre_compile(String_val(v_pat), v_opt, &error, &error_ofs, tables);
+      pcre_compile(pattern_copy, v_opt, &error, &error_ofs, tables);
 
   /* Raises appropriate exception with [BadPattern] if the pattern
      could not be compiled */
-  if (regexp == NULL)
+  if (regexp == NULL) {
+    caml_stat_free(pattern_copy);
     raise_bad_pattern(error, error_ofs);
+  }
 
   /* It's unknown at this point whether the user will study the pattern
      later (probably), or if JIT compilation is going to be used, but we
@@ -338,12 +393,17 @@ CAMLprim value pcre_compile_stub(intnat v_opt, value v_tables, value v_pat) {
      roughly 50% increase in size when studying without JIT.  A factor of
      two times hence seems like a reasonable bound to use here. */
   pcre_fullinfo(regexp, NULL, PCRE_INFO_SIZE, &regexp_size);
-  v_rex =
-      caml_alloc_custom_mem(&regexp_ops, ocaml_regexp_size, 2 * regexp_size);
+  v_rex = caml_alloc_custom_mem(&regexp_ops, ocaml_regexp_size,
+                                2 * regexp_size + pattern_len);
 
   set_rex(v_rex, regexp);
   set_extra(v_rex, NULL);
   set_studied(v_rex, 0);
+  set_jit_compile(v_rex, 0);
+  set_compile_options(v_rex, (int)v_opt);
+  set_has_custom_tables(v_rex, has_custom_tables);
+  set_pattern_len(v_rex, pattern_len);
+  set_pattern(v_rex, pattern_copy);
 
   return v_rex;
 }
@@ -357,14 +417,169 @@ CAMLprim value pcre_study_stub(value v_rex, value v_jit_compile) {
   /* If it has not yet been studied */
   if (!get_studied(v_rex)) {
     const char *error = NULL;
-    int flags = Bool_val(v_jit_compile) ? PCRE_STUDY_JIT_COMPILE : 0;
+    int jit = Bool_val(v_jit_compile);
+    int flags = jit ? PCRE_STUDY_JIT_COMPILE : 0;
     pcre_extra *extra = pcre_study(get_rex(v_rex), flags, &error);
     if (error != NULL)
       caml_invalid_argument((char *)error);
     set_extra(v_rex, extra);
     set_studied(v_rex, 1);
+    set_jit_compile(v_rex, jit);
   }
   return v_rex;
+}
+
+/* Returns the source pattern that was passed to pcre_compile. */
+CAMLprim value pcre_pattern_stub(value v_rex) {
+  CAMLparam1(v_rex);
+  size_t len = get_pattern_len(v_rex);
+  const char *pat = get_pattern(v_rex);
+  CAMLreturn(caml_alloc_initialized_string(len, pat));
+}
+
+/* Returns whether pcre_study was called with JIT compilation enabled. */
+CAMLprim value pcre_jit_compiled_stub(value v_rex) {
+  return Val_bool(get_jit_compile(v_rex));
+}
+
+/* Lazily allocates pcre_extra and sets the match_limit field, mirroring
+   the existing setter stubs.  Used by both [pcre_set_imp_match_limit_stub]
+   and the marshal deserializer. */
+static void apply_match_limit(struct pcre_ocaml_regexp *r, int v_lim) {
+  pcre_extra *extra = r->extra;
+  if (extra == NULL) {
+    extra = pcre_malloc(sizeof(pcre_extra));
+    extra->flags = PCRE_EXTRA_MATCH_LIMIT;
+    r->extra = extra;
+  } else {
+    extra->flags |= PCRE_EXTRA_MATCH_LIMIT;
+  }
+  extra->match_limit = v_lim;
+}
+
+static void apply_match_limit_recursion(struct pcre_ocaml_regexp *r,
+                                        int v_lim) {
+  pcre_extra *extra = r->extra;
+  if (extra == NULL) {
+    extra = pcre_malloc(sizeof(pcre_extra));
+    extra->flags = PCRE_EXTRA_MATCH_LIMIT_RECURSION;
+    r->extra = extra;
+  } else {
+    extra->flags |= PCRE_EXTRA_MATCH_LIMIT_RECURSION;
+  }
+  extra->match_limit_recursion = v_lim;
+}
+
+/* Marshal serialization for compiled regexps.
+
+   Strategy: instead of trying to dump opaque PCRE bytecode (which has
+   no portable binary form in PCRE1), we write the *recipe* — source
+   pattern, compile options, study/JIT state, and any imperatively-set
+   match limits — and recompile on the other side.  Patterns built with
+   custom chartables are not supported because the chartable bytes are
+   not preserved on the regexp; serialization raises Failure in that
+   case. */
+
+#define PCRE_OCAML_REGEXP_MARSHAL_VERSION 1
+
+static void pcre_serialize_regexp(value v_rex, uintnat *bsize_32,
+                                  uintnat *bsize_64) {
+  if (get_has_custom_tables(v_rex))
+    caml_failwith(
+        "Pcre: cannot Marshal regexp built with custom chartables");
+
+  pcre_extra *extra = get_extra(v_rex);
+  int has_match_limit = 0;
+  int has_match_limit_recursion = 0;
+  int match_limit = 0;
+  int match_limit_recursion = 0;
+  if (extra != NULL) {
+    if (extra->flags & PCRE_EXTRA_MATCH_LIMIT) {
+      has_match_limit = 1;
+      match_limit = (int)extra->match_limit;
+    }
+    if (extra->flags & PCRE_EXTRA_MATCH_LIMIT_RECURSION) {
+      has_match_limit_recursion = 1;
+      match_limit_recursion = (int)extra->match_limit_recursion;
+    }
+  }
+
+  caml_serialize_int_1(PCRE_OCAML_REGEXP_MARSHAL_VERSION);
+  caml_serialize_int_4((int32_t)get_compile_options(v_rex));
+  caml_serialize_int_1(get_studied(v_rex) ? 1 : 0);
+  caml_serialize_int_1(get_jit_compile(v_rex) ? 1 : 0);
+  caml_serialize_int_1(has_match_limit ? 1 : 0);
+  if (has_match_limit)
+    caml_serialize_int_4((int32_t)match_limit);
+  caml_serialize_int_1(has_match_limit_recursion ? 1 : 0);
+  if (has_match_limit_recursion)
+    caml_serialize_int_4((int32_t)match_limit_recursion);
+  caml_serialize_int_8((int64_t)get_pattern_len(v_rex));
+  caml_serialize_block_1(get_pattern(v_rex), (intnat)get_pattern_len(v_rex));
+
+  *bsize_32 = sizeof(struct pcre_ocaml_regexp);
+  *bsize_64 = sizeof(struct pcre_ocaml_regexp);
+}
+
+static uintnat pcre_deserialize_regexp(void *dst) {
+  struct pcre_ocaml_regexp *r = (struct pcre_ocaml_regexp *)dst;
+  /* Zero first so that if we raise mid-construction the finalizer
+     (pcre_dealloc_regexp) sees a safe partially-populated struct. */
+  memset(r, 0, sizeof(*r));
+
+  int version = (int)caml_deserialize_uint_1();
+  if (version != PCRE_OCAML_REGEXP_MARSHAL_VERSION)
+    caml_failwith("Pcre: unsupported marshal format version");
+
+  int compile_options = (int)caml_deserialize_sint_4();
+  int studied = (int)caml_deserialize_uint_1();
+  int jit_compile = (int)caml_deserialize_uint_1();
+  int has_match_limit = (int)caml_deserialize_uint_1();
+  int match_limit = 0;
+  if (has_match_limit)
+    match_limit = (int)caml_deserialize_sint_4();
+  int has_match_limit_recursion = (int)caml_deserialize_uint_1();
+  int match_limit_recursion = 0;
+  if (has_match_limit_recursion)
+    match_limit_recursion = (int)caml_deserialize_sint_4();
+  size_t pattern_len = (size_t)caml_deserialize_sint_8();
+
+  char *pattern = caml_stat_alloc(pattern_len + 1);
+  caml_deserialize_block_1(pattern, (intnat)pattern_len);
+  pattern[pattern_len] = '\0';
+
+  /* Stash pattern early so the finalizer frees it if anything below
+     raises. */
+  r->pattern = pattern;
+  r->pattern_len = pattern_len;
+  r->compile_options = compile_options;
+
+  const char *error = NULL;
+  int error_ofs = 0;
+  pcre *rex =
+      pcre_compile(pattern, compile_options, &error, &error_ofs, NULL);
+  if (rex == NULL)
+    caml_failwith(error != NULL ? error
+                                : "Pcre: pcre_compile failed during unmarshal");
+  r->rex = rex;
+
+  if (studied) {
+    const char *study_error = NULL;
+    int flags = jit_compile ? PCRE_STUDY_JIT_COMPILE : 0;
+    pcre_extra *extra = pcre_study(rex, flags, &study_error);
+    if (study_error != NULL)
+      caml_failwith(study_error);
+    r->extra = extra;
+    r->studied = 1;
+    r->jit_compile = jit_compile;
+  }
+
+  if (has_match_limit)
+    apply_match_limit(r, match_limit);
+  if (has_match_limit_recursion)
+    apply_match_limit_recursion(r, match_limit_recursion);
+
+  return sizeof(struct pcre_ocaml_regexp);
 }
 
 /* Gets the match limit recursion of a regular expression if it exists */
@@ -398,16 +613,7 @@ CAMLprim value pcre_get_match_limit_stub(value v_rex) {
 /* Sets a match limit for a regular expression imperatively */
 
 CAMLprim value pcre_set_imp_match_limit_stub(value v_rex, intnat v_lim) {
-  pcre_extra *extra = get_extra(v_rex);
-  if (extra == NULL) {
-    extra = pcre_malloc(sizeof(pcre_extra));
-    extra->flags = PCRE_EXTRA_MATCH_LIMIT;
-    set_extra(v_rex, extra);
-  } else {
-    unsigned long *flags_ptr = &extra->flags;
-    *flags_ptr = PCRE_EXTRA_MATCH_LIMIT | *flags_ptr;
-  }
-  extra->match_limit = v_lim;
+  apply_match_limit(Pcre_ocaml_regexp_val(v_rex), (int)v_lim);
   return v_rex;
 }
 
@@ -419,16 +625,7 @@ CAMLprim value pcre_set_imp_match_limit_stub_bc(value v_rex, value v_lim) {
 
 CAMLprim value pcre_set_imp_match_limit_recursion_stub(value v_rex,
                                                        intnat v_lim) {
-  pcre_extra *extra = get_extra(v_rex);
-  if (extra == NULL) {
-    extra = pcre_malloc(sizeof(pcre_extra));
-    extra->flags = PCRE_EXTRA_MATCH_LIMIT_RECURSION;
-    set_extra(v_rex, extra);
-  } else {
-    unsigned long *flags_ptr = &extra->flags;
-    *flags_ptr = PCRE_EXTRA_MATCH_LIMIT_RECURSION | *flags_ptr;
-  }
-  extra->match_limit_recursion = v_lim;
+  apply_match_limit_recursion(Pcre_ocaml_regexp_val(v_rex), (int)v_lim);
   return v_rex;
 }
 

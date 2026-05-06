@@ -1,0 +1,3 @@
+(tests
+ (names pcre_marshal_test pcre_bin_prot_test)
+ (libraries pcre pcre_bin_prot bin_prot))

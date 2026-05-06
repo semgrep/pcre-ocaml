@@ -29,3 +29,16 @@
   dune-configurator
   (conf-libpcre :build)
   (ounit2 :with-test)))
+
+(package
+ (name pcre_bin_prot)
+ (synopsis "bin_prot serializers for Pcre.regexp")
+ (description
+   "Provides Bin_prot.Type_class.t for Pcre.regexp by round-tripping\nthrough the source pattern + compile flags and recompiling on read.")
+ (depends
+  (ocaml
+   (>= 4.08))
+  (pcre
+   (= :version))
+  bin_prot
+  ppx_bin_prot))

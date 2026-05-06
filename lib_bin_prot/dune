@@ -1,0 +1,4 @@
+(library
+ (public_name pcre_bin_prot)
+ (libraries pcre bin_prot)
+ (preprocess (pps ppx_bin_prot)))

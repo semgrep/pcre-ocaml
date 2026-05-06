@@ -96,6 +96,14 @@ val cflag_list : icflag -> cflag list
 (** [cflag_list cflags] converts internal representation of compilation flags to
     a list. *)
 
+val int_of_icflag : icflag -> int
+(** [int_of_icflag flags] returns the underlying integer representation of
+    [flags]. Useful for serialization. *)
+
+val icflag_of_int : int -> icflag
+(** [icflag_of_int n] returns the [icflag] value corresponding to the raw
+    bitmask [n]. *)
+
 type rflag =
   [ `ANCHORED  (** Treats pattern as if it were anchored *)
   | `NOTBOL  (** Beginning of string is not treated as beginning of line *)
@@ -221,6 +229,16 @@ val study_stat : regexp -> study_stat
 (** [study_stat regexp]
 
     @return study status of [regexp]. *)
+
+val pattern : regexp -> string
+(** [pattern regexp]
+
+    @return the source pattern string from which [regexp] was compiled. *)
+
+val jit_compiled : regexp -> bool
+(** [jit_compiled regexp]
+
+    @return [true] if [regexp] was studied with JIT compilation enabled. *)
 
 val get_stringnumber : regexp -> string -> int
 (** [get_stringnumber rex name]
