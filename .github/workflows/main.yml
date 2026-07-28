@@ -21,10 +21,10 @@ jobs:
 
     steps:
       - name: Checkout tree
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Set-up OCaml
-        uses: ocaml/setup-ocaml@v3
+        uses: ocaml/setup-ocaml@15d660006c1d3110d77c34b7faa3bddefe8b82f0 # v3.7.0
         with:
           ocaml-compiler: 5
 
@@ -38,31 +38,31 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout tree
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - name: Set-up OCaml
-        uses: ocaml/setup-ocaml@v3
+        uses: ocaml/setup-ocaml@15d660006c1d3110d77c34b7faa3bddefe8b82f0 # v3.7.0
         with:
           ocaml-compiler: 5
-      - uses: ocaml/setup-ocaml/lint-doc@v3
+      - uses: ocaml/setup-ocaml/lint-doc@15d660006c1d3110d77c34b7faa3bddefe8b82f0 # v3.7.0
 
   lint-fmt:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout tree
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - name: Set-up OCaml
-        uses: ocaml/setup-ocaml@v3
+        uses: ocaml/setup-ocaml@15d660006c1d3110d77c34b7faa3bddefe8b82f0 # v3.7.0
         with:
           ocaml-compiler: 5
-      - uses: ocaml/setup-ocaml/lint-fmt@v3
+      - uses: ocaml/setup-ocaml/lint-fmt@15d660006c1d3110d77c34b7faa3bddefe8b82f0 # v3.7.0
 
   lint-opam:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout tree
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - name: Set-up OCaml
-        uses: ocaml/setup-ocaml@v3
+        uses: ocaml/setup-ocaml@15d660006c1d3110d77c34b7faa3bddefe8b82f0 # v3.7.0
         with:
           ocaml-compiler: 5
-      - uses: ocaml/setup-ocaml/lint-opam@v3
+      - uses: ocaml/setup-ocaml/lint-opam@15d660006c1d3110d77c34b7faa3bddefe8b82f0 # v3.7.0
